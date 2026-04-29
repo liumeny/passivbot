@@ -703,8 +703,6 @@ class Passivbot:
         self._pnls_manager: Optional[FillEventsManager] = None
         self._pnls_initialized = False
         self._pnls_update_lock = asyncio.Lock()
-        self._telegram = None  # TelegramService instance (optional interactive bot)
-        self._control_queue = asyncio.Queue()  # Control actions from Telegram
         self._telegram_reporter: Optional[TelegramReportManager] = None
 
         # Health tracking for periodic summary
@@ -998,7 +996,6 @@ class Passivbot:
         logging.info("[boot] ══════════════════════════════════════════════════════════════════════")
         logging.info("[boot] READY - Bot initialization complete, entering main trading loop")
         logging.info("[boot] ══════════════════════════════════════════════════════════════════════")
-        await self._start_telegram()
         if not self.debug_mode:
             await self.run_execution_loop()
 
@@ -1901,7 +1898,6 @@ class Passivbot:
                 self._maybe_log_health_summary()
                 self._maybe_log_unstuck_status()
                 await asyncio.sleep(float(self.live_value("execution_delay_seconds")))
-                await self._process_control_queue()
                 sleep_duration = 30
                 for i in range(sleep_duration * 10):
                     if self.execution_scheduled:
@@ -1928,7 +1924,6 @@ class Passivbot:
         self._shutdown_in_progress = True
         self.stop_signal_received = True
         logging.info("[shutdown] shutdown requested; closing background tasks and sessions")
-        await self._stop_telegram()
         try:
             self.stop_data_maintainers(verbose=False)
         except Exception as e:
@@ -1945,115 +1940,6 @@ class Passivbot:
         except Exception as e:
             logging.error("[shutdown] error closing public ccxt session: %s", e)
         logging.info("[shutdown] cleanup complete")
-
-    # ── Telegram Integration ──────────────────────────────────────────
-
-    async def _start_telegram(self) -> None:
-        """Start the interactive Telegram service when configured."""
-        tg_config = dict(self.config.get("telegram", {}) or {})
-        if not tg_config:
-            credentials_path = get_optional_live_value(self.config, "telegram_credentials_path", "")
-            if credentials_path:
-                tg_config = {
-                    "enabled": True,
-                    "credentials_path": credentials_path,
-                    "read_only": True,
-                    "keyboard": [
-                        ["账务总余额", "当前持仓"],
-                        ["过去24h仓位", "帮助"],
-                    ],
-                }
-        if not tg_config.get("enabled", False):
-            return
-
-        try:
-            from telegram_service import TelegramService, HAS_TELEGRAM
-            from telegram_commands import register_commands
-
-            if not HAS_TELEGRAM:
-                logging.warning(
-                    "[telegram] python-telegram-bot not installed; skipping. "
-                    "Install with: pip install 'python-telegram-bot>=21.0'"
-                )
-                return
-
-            self._telegram = TelegramService(tg_config, self)
-            await self._telegram.start(register_commands)
-
-            exchange = getattr(self, "exchange", "?")
-            user = getattr(self, "user", "?")
-            await self._telegram.send_message(
-                f"🟢 <b>Passivbot started</b>\n"
-                f"Exchange: <code>{exchange}</code>\n"
-                f"Account: <code>{user}</code>"
-            )
-            logging.info("[telegram] startup notification sent")
-        except Exception as e:
-            logging.error("[telegram] failed to start: %s", e)
-            self._telegram = None
-
-    async def _stop_telegram(self) -> None:
-        """Gracefully stop the interactive Telegram service."""
-        if self._telegram is None:
-            return
-        try:
-            await self._telegram.send_message("🔴 <b>Passivbot shutting down</b>")
-            await self._telegram.stop()
-        except Exception as e:
-            logging.warning("[telegram] error during stop: %s", e)
-        finally:
-            self._telegram = None
-
-    async def _process_control_queue(self) -> None:
-        """Process optional Telegram control actions."""
-        while not self._control_queue.empty():
-            try:
-                action = self._control_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-
-            action_type = getattr(action, "action_type", "")
-            user_id = getattr(action, "user_id", "?")
-
-            try:
-                if action_type == "set_mode":
-                    side = getattr(action, "side", "")
-                    mode = getattr(action, "mode", "graceful_stop")
-                    if side in ("long", "short"):
-                        self.PB_mode_stop[side] = mode
-                        self.determine_PB_modes()
-                        msg = (
-                            f"⚙️ Mode changed: <code>{side}</code> → <code>{mode}</code> "
-                            f"(by user {user_id})"
-                        )
-                        logging.info(
-                            "[telegram] applied set_mode: %s -> %s (user=%s)",
-                            side,
-                            mode,
-                            user_id,
-                        )
-                        if self._telegram:
-                            await self._telegram.send_message(msg)
-                elif action_type == "restart":
-                    logging.info("[telegram] restart requested by user=%s", user_id)
-                    if self._telegram:
-                        await self._telegram.send_message(
-                            f"🔄 <b>Restart requested</b> by user {user_id}"
-                        )
-                    raise RestartBotException("Restart requested via Telegram")
-                else:
-                    logging.warning("[telegram] unknown control action: %s", action_type)
-            except RestartBotException:
-                raise
-            except Exception as e:
-                logging.error("[telegram] error processing control action %s: %s", action_type, e)
-                if self._telegram:
-                    try:
-                        await self._telegram.send_message(
-                            f"❌ Error processing <code>{action_type}</code>: {e}"
-                        )
-                    except Exception:
-                        pass
 
     async def update_pos_oos_pnls_ohlcvs(self) -> bool:
         """Refresh positions, open orders, realised PnL, and 1m candles."""
@@ -2744,10 +2630,7 @@ class Passivbot:
         if not hasattr(self, "already_updated_exchange_config_symbols"):
             self.already_updated_exchange_config_symbols = set()
         symbols_not_done = [
-            x
-            for x in self.active_symbols
-            if x not in self.already_updated_exchange_config_symbols
-            and self._symbol_requires_exchange_config(x)
+            x for x in self.active_symbols if x not in self.already_updated_exchange_config_symbols
         ]
         if symbols_not_done:
             try:
@@ -2766,28 +2649,6 @@ class Passivbot:
         """Exchange-specific hook to refresh global config state."""
         # defined by each exchange child class
         pass
-
-    def _symbol_counts_toward_strategy(self, pside: str, symbol: str) -> bool:
-        """Return True if the symbol should affect strategy capacity for the side."""
-        forced_mode = self.get_forced_PB_mode(pside, symbol)
-        if forced_mode == "manual":
-            return False
-        if forced_mode is not None:
-            return True
-        approved = getattr(self, "approved_coins_minus_ignored_coins", {}).get(pside, set())
-        return symbol in approved
-
-    def _symbol_requires_exchange_config(self, symbol: str) -> bool:
-        """Return True when a symbol is not manual-only across both sides."""
-        seen = False
-        for pside in ("long", "short"):
-            mode = self.PB_modes.get(pside, {}).get(symbol)
-            if mode is None:
-                continue
-            seen = True
-            if mode != "manual":
-                return True
-        return not seen
 
     def is_old_enough(self, pside, symbol):
         """Return True if the market age exceeds the configured minimum for forager mode."""
@@ -2871,26 +2732,18 @@ class Passivbot:
             }
             max_n_positions = self.get_max_n_positions(pside)
             symbols_with_pos = self.get_symbols_with_pos(pside)
-            managed_symbols_with_pos = [
-                symbol
-                for symbol in symbols_with_pos
-                if self._symbol_counts_toward_strategy(pside, symbol)
-            ]
             for symbol in symbols_with_pos:
                 if symbol in self.PB_modes[pside]:
                     continue
                 elif forced_mode := self.get_forced_PB_mode(pside, symbol):
                     self.PB_modes[pside][symbol] = forced_mode
-                elif not self._symbol_counts_toward_strategy(pside, symbol):
-                    self.PB_modes[pside][symbol] = "manual"
-                    continue
                 else:
                     if symbol in self.ineligible_symbols:
                         if self.ineligible_symbols[symbol] == "not active":
                             self.PB_modes[pside][symbol] = "tp_only"
                         else:
                             self.PB_modes[pside][symbol] = "manual"
-                    elif len(managed_symbols_with_pos) > max_n_positions:
+                    elif len(symbols_with_pos) > max_n_positions:
                         self.PB_modes[pside][symbol] = self.PB_mode_stop[pside]
                     elif symbol in ideal_coins:
                         self.PB_modes[pside][symbol] = "normal"
@@ -2909,12 +2762,7 @@ class Passivbot:
             for symbol in self.open_orders:
                 if symbol in self.PB_modes[pside]:
                     continue
-                elif forced_mode := self.get_forced_PB_mode(pside, symbol):
-                    self.PB_modes[pside][symbol] = forced_mode
-                elif not self._symbol_counts_toward_strategy(pside, symbol):
-                    self.PB_modes[pside][symbol] = "manual"
-                else:
-                    self.PB_modes[pside][symbol] = self.PB_mode_stop[pside]
+                self.PB_modes[pside][symbol] = self.PB_mode_stop[pside]
         self.active_symbols = sorted(
             {s for subdict in self.PB_modes.values() for s in subdict.keys()}
         )
@@ -3296,10 +3144,12 @@ class Passivbot:
         """Count open positions for the side, excluding inactive forced modes."""
         n_positions = 0
         for symbol in self.positions:
-            if self.positions[symbol][pside]["size"] != 0.0 and self._symbol_counts_toward_strategy(
-                pside, symbol
-            ):
-                n_positions += 1
+            if self.positions[symbol][pside]["size"] != 0.0:
+                forced_mode = self.get_forced_PB_mode(pside, symbol)
+                if forced_mode in ["normal", "graceful_stop"]:
+                    n_positions += 1
+                else:
+                    n_positions += 1
         return n_positions
 
     def get_forced_PB_mode(self, pside, symbol=None):
@@ -5694,12 +5544,8 @@ class Passivbot:
             ) | self.get_symbols_approved_or_has_pos("short")
         return (
             self.approved_coins_minus_ignored_coins[pside]
-            | {s for s in self.get_symbols_with_pos(pside) if self._symbol_counts_toward_strategy(pside, s)}
-            | {
-                s
-                for s in self.coin_overrides
-                if (forced_mode := self.get_forced_PB_mode(pside, s)) and forced_mode != "manual"
-            }
+            | self.get_symbols_with_pos(pside)
+            | {s for s in self.coin_overrides if self.get_forced_PB_mode(pside, s) == "normal"}
         )
 
     # Legacy get_ohlcvs_1m_file_mods removed

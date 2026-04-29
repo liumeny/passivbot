@@ -590,6 +590,62 @@ async def test_binance_fetcher_position_side_from_trade(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_binance_fetcher_infers_one_way_position_side_from_client_order_id(monkeypatch):
+    """Test one-way Binance trades infer long/short from the bot client order id."""
+    trades = [
+        {
+            "id": "trade-one-way-1",
+            "timestamp": 1_700_000_000_000,
+            "symbol": "ETH/USDT:USDT",
+            "side": "sell",
+            "amount": 1.0,
+            "price": 2000.0,
+            "fee": {"currency": "USDT", "cost": 0.01},
+            "order": "order-123",
+            "clientOrderId": "close_grid_long",
+            "info": {
+                "positionSide": "BOTH",
+                "clientOrderId": "close_grid_long",
+            },
+        }
+    ]
+
+    fetcher = BinanceFetcher(
+        api=object(),
+        symbol_resolver=lambda sym: sym or "",
+        positions_provider=lambda: ["ETH/USDT:USDT"],
+        open_orders_provider=lambda: [],
+    )
+
+    async def fake_fetch_income(self, *_args, **_kwargs):
+        return []
+
+    async def fake_fetch_trades(self, symbol, *_args, **_kwargs):
+        return list(trades if symbol == "ETH/USDT:USDT" else [])
+
+    monkeypatch.setattr("src.fill_events_manager.custom_id_to_snake", lambda v: v or "unknown")
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_income",
+        types.MethodType(fake_fetch_income, fetcher),
+    )
+    monkeypatch.setattr(
+        fetcher,
+        "_fetch_symbol_trades",
+        types.MethodType(fake_fetch_trades, fetcher),
+    )
+
+    events = await fetcher.fetch(
+        since_ms=trades[0]["timestamp"] - 1,
+        until_ms=trades[0]["timestamp"] + 1,
+        detail_cache={},
+    )
+
+    assert len(events) == 1
+    assert events[0]["position_side"] == "long"
+
+
+@pytest.mark.asyncio
 async def test_binance_fetcher_fees_from_trade(monkeypatch):
     """Test fees are captured from trades."""
     trades = [

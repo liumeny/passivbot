@@ -1368,6 +1368,72 @@ class BinanceFetcher(BaseFetcher):
         self._unsupported_symbols.add(symbol)
         logger.debug("[fills] BinanceFetcher skipping unsupported symbol %s", symbol)
 
+    def _extract_client_order_id(self, entry: Dict[str, object]) -> str:
+        info = entry.get("info") if isinstance(entry.get("info"), dict) else {}
+        return str(
+            entry.get("client_order_id")
+            or entry.get("clientOrderId")
+            or info.get("clientOrderId")
+            or info.get("origClientOrderId")
+            or info.get("clientOrderID")
+            or ""
+        )
+
+    def _extract_reduce_only(self, entry: Dict[str, object]) -> Optional[bool]:
+        sentinel = object()
+        reduce_only = entry.get("reduce_only", sentinel)
+        if reduce_only is sentinel:
+            reduce_only = entry.get("reduceOnly", sentinel)
+        if reduce_only is sentinel:
+            info = entry.get("info") if isinstance(entry.get("info"), dict) else {}
+            reduce_only = info.get("reduceOnly", sentinel)
+        if reduce_only is sentinel:
+            return None
+        if isinstance(reduce_only, str):
+            return reduce_only.lower() == "true"
+        return bool(reduce_only)
+
+    def _infer_position_side_from_pb_type(self, pb_type: str) -> Optional[str]:
+        if not pb_type:
+            return None
+        if pb_type.endswith("_long"):
+            return "long"
+        if pb_type.endswith("_short"):
+            return "short"
+        return None
+
+    def _infer_position_side_from_client_order_id(self, client_order_id: str) -> Optional[str]:
+        if not client_order_id:
+            return None
+        return self._infer_position_side_from_pb_type(custom_id_to_snake(client_order_id))
+
+    def _infer_one_way_position_side(self, entry: Dict[str, object]) -> str:
+        side = str(entry.get("side") or "").lower()
+        reduce_only = self._extract_reduce_only(entry)
+        if reduce_only is not None and side in ("buy", "sell"):
+            if side == "buy":
+                return "short" if reduce_only else "long"
+            return "long" if reduce_only else "short"
+
+        client_order_id = self._extract_client_order_id(entry)
+        if inferred := self._infer_position_side_from_client_order_id(client_order_id):
+            return inferred
+        return "unknown"
+
+    def _normalize_position_side(
+        self,
+        raw_position_side: object,
+        entry: Optional[Dict[str, object]] = None,
+    ) -> str:
+        position_side = str(raw_position_side or "").lower()
+        if position_side in ("long", "short"):
+            return position_side
+        if position_side in ("both", "net", "", "unknown"):
+            if entry is None:
+                return "unknown"
+            return self._infer_one_way_position_side(entry)
+        return "unknown"
+
     async def fetch(
         self,
         since_ms: Optional[int],
@@ -1539,6 +1605,9 @@ class BinanceFetcher(BaseFetcher):
                 ev["pb_order_type"] = custom_id_to_snake(str(client_oid))
             if not ev.get("pb_order_type"):
                 ev["pb_order_type"] = ""
+            if ev.get("position_side") in ("", "unknown", "both", "net"):
+                inferred = self._infer_position_side_from_pb_type(ev["pb_order_type"])
+                ev["position_side"] = inferred or "unknown"
             ev["client_order_id"] = str(client_oid) if client_oid is not None else ""
             if event_id and ev.get("client_order_id"):
                 detail_cache[event_id] = (ev["client_order_id"], ev["pb_order_type"])
@@ -1732,7 +1801,10 @@ class BinanceFetcher(BaseFetcher):
         raw_symbol = entry.get("symbol")
         ccxt_symbol = self._resolve_symbol(raw_symbol)
         pnl = float(entry.get("income") or entry.get("pnl") or 0.0)
-        position_side = str(entry.get("positionSide") or entry.get("pside") or "unknown").lower()
+        position_side = self._normalize_position_side(
+            entry.get("positionSide") or entry.get("pside"),
+            entry=entry,
+        )
         return {
             "id": str(trade_id),
             "timestamp": timestamp,
@@ -1753,9 +1825,10 @@ class BinanceFetcher(BaseFetcher):
         trade_id = trade.get("id") or info.get("id")
         timestamp = int(trade.get("timestamp") or info.get("time") or info.get("T") or 0)
         pnl = float(info.get("realizedPnl") or trade.get("pnl") or 0.0)
-        position_side = str(
-            info.get("positionSide") or trade.get("position_side") or "unknown"
-        ).lower()
+        position_side = self._normalize_position_side(
+            info.get("positionSide") or trade.get("position_side"),
+            entry=trade,
+        )
         fees = trade.get("fees") or trade.get("fee")
         client_order_id = (
             trade.get("clientOrderId")

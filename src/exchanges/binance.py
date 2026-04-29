@@ -1,5 +1,5 @@
 from exchanges.ccxt_bot import CCXTBot, format_exchange_config_response
-from passivbot import logging
+from passivbot import logging, custom_id_to_snake
 
 import asyncio
 import random
@@ -13,6 +13,7 @@ class BinanceBot(CCXTBot):
     def __init__(self, config: dict):
         super().__init__(config)
         self.custom_id_max_length = 36
+        self.binance_position_mode_hedged = True
 
     def create_ccxt_sessions(self):
         """Binance: Add broker codes after standard setup."""
@@ -75,9 +76,99 @@ class BinanceBot(CCXTBot):
 
     # ═══════════════════ HOOK OVERRIDES ═══════════════════
 
+    def _extract_client_order_id(self, data: dict) -> str:
+        info = data.get("info", {}) if isinstance(data.get("info"), dict) else {}
+        return (
+            data.get("clientOrderId")
+            or data.get("custom_id")
+            or info.get("clientOrderId")
+            or info.get("origClientOrderId")
+            or info.get("clientOrderID")
+            or info.get("c")
+            or ""
+        )
+
+    def _extract_reduce_only(self, data: dict):
+        sentinel = object()
+        reduce_only = data.get("reduce_only", sentinel)
+        if reduce_only is sentinel:
+            reduce_only = data.get("reduceOnly", sentinel)
+        if reduce_only is sentinel:
+            info = data.get("info", {}) if isinstance(data.get("info"), dict) else {}
+            reduce_only = info.get("reduceOnly", sentinel)
+        if reduce_only is sentinel:
+            return None
+        if isinstance(reduce_only, str):
+            return reduce_only.lower() == "true"
+        return bool(reduce_only)
+
+    def _infer_position_side_from_client_order_id(self, client_order_id: str):
+        if not client_order_id:
+            return None
+        pb_type = custom_id_to_snake(str(client_order_id))
+        if pb_type.endswith("_long"):
+            return "long"
+        if pb_type.endswith("_short"):
+            return "short"
+        return None
+
+    def _infer_one_way_position_side(self, data: dict) -> str:
+        side = str(data.get("side") or "").lower()
+        reduce_only = self._extract_reduce_only(data)
+        if reduce_only is not None and side in ("buy", "sell"):
+            if side == "buy":
+                return "short" if reduce_only else "long"
+            return "long" if reduce_only else "short"
+
+        client_order_id = self._extract_client_order_id(data)
+        if inferred := self._infer_position_side_from_client_order_id(client_order_id):
+            return inferred
+
+        symbol = data.get("symbol")
+        if symbol:
+            has_long = self.has_position("long", symbol)
+            has_short = self.has_position("short", symbol)
+            if has_long != has_short:
+                return "long" if has_long else "short"
+
+        if side == "buy":
+            return "long"
+        if side == "sell":
+            return "short"
+        raise Exception(f"unable to infer Binance one-way position side from order {data}")
+
+    def _resolve_position_side(self, raw_position_side, data: dict = None, size: float = None) -> str:
+        position_side = str(raw_position_side or "").lower()
+        if position_side in ("long", "short"):
+            return position_side
+        if position_side in ("both", "net", ""):
+            if size is not None and float(size) != 0.0:
+                return "long" if float(size) > 0.0 else "short"
+            if data is not None:
+                return self._infer_one_way_position_side(data)
+        raise Exception(
+            f"unsupported Binance position side {raw_position_side} "
+            f"(size={size}, symbol={None if data is None else data.get('symbol')})"
+        )
+
     def _get_position_side_for_order(self, order: dict) -> str:
-        """Binance provides ps (positionSide) in info."""
-        return order.get("info", {}).get("ps", "long").lower()
+        """Binance provides ps/positionSide, or BOTH in one-way mode."""
+        info = order.get("info", {}) if isinstance(order.get("info"), dict) else {}
+        raw_position_side = info.get("ps") or info.get("positionSide") or order.get("position_side")
+        return self._resolve_position_side(raw_position_side, data=order)
+
+    def _get_position_side_from_trade(self, trade: dict) -> str:
+        info = trade.get("info", {}) if isinstance(trade.get("info"), dict) else {}
+        raw_position_side = info.get("positionSide") or trade.get("position_side")
+        position_side = str(raw_position_side or "").lower()
+        if position_side in ("long", "short"):
+            return position_side
+        if position_side in ("both", "net", "", "unknown"):
+            client_order_id = self._extract_client_order_id(trade)
+            if inferred := self._infer_position_side_from_client_order_id(client_order_id):
+                return inferred
+            return "unknown"
+        raise Exception(f"unsupported Binance trade position side {raw_position_side}")
 
     async def _do_fetch_positions(self) -> list:
         """Binance: Use fapiprivatev3_get_positionrisk endpoint."""
@@ -87,12 +178,15 @@ class BinanceBot(CCXTBot):
         """Binance: Parse positionrisk response format."""
         positions = []
         for elm in fetched:
-            if float(elm["positionAmt"]) != 0.0:
+            size = float(elm["positionAmt"])
+            if size != 0.0:
                 positions.append(
                     {
                         "symbol": self.get_symbol_id_inv(elm["symbol"]),
-                        "position_side": elm["positionSide"].lower(),
-                        "size": float(elm["positionAmt"]),
+                        "position_side": self._resolve_position_side(
+                            elm.get("positionSide"), size=size
+                        ),
+                        "size": size,
                         "price": float(elm["entryPrice"]),
                     }
                 )
@@ -124,7 +218,7 @@ class BinanceBot(CCXTBot):
 
         open_orders = {}
         for elm in fetched:
-            elm["position_side"] = elm["info"]["positionSide"].lower()
+            elm["position_side"] = self._get_position_side_for_order(elm)
             elm["qty"] = elm["amount"]
             open_orders[elm["id"]] = elm
         return sorted(open_orders.values(), key=lambda x: x["timestamp"])
@@ -310,7 +404,7 @@ class BinanceBot(CCXTBot):
         all_fills = sorted(all_fills.values(), key=lambda x: x["timestamp"])
         for i in range(len(all_fills)):
             all_fills[i]["pnl"] = float(all_fills[i]["info"]["realizedPnl"])
-            all_fills[i]["position_side"] = all_fills[i]["info"]["positionSide"].lower()
+            all_fills[i]["position_side"] = self._get_position_side_from_trade(all_fills[i])
         return all_fills
 
     async def fetch_pnl(
@@ -337,14 +431,16 @@ class BinanceBot(CCXTBot):
             fetched[i]["pnl"] = float(fetched[i]["income"])
             fetched[i]["timestamp"] = float(fetched[i]["time"])
             fetched[i]["id"] = fetched[i]["tradeId"]
+            fetched[i]["position_side"] = self._get_position_side_from_trade(fetched[i])
         return sorted(fetched, key=lambda x: x["timestamp"])
 
     def _build_order_params(self, order: dict) -> dict:
         order_type = order.get("type", "limit")
-        params = {
-            "positionSide": order["position_side"].upper(),
-            "newClientOrderId": order["custom_id"],
-        }
+        params = {"newClientOrderId": order["custom_id"]}
+        if getattr(self, "binance_position_mode_hedged", True):
+            params["positionSide"] = order["position_side"].upper()
+        elif order.get("reduce_only"):
+            params["reduceOnly"] = True
         if order_type == "limit":
             tif = require_live_value(self.config, "time_in_force")
             params["timeInForce"] = "GTX" if tif == "post_only" else "GTC"
@@ -378,14 +474,16 @@ class BinanceBot(CCXTBot):
                 logging.info(f"{symbol}: {to_print}")
 
     async def update_exchange_config(self):
-        try:
-            res = await self.cca.set_position_mode(True)
-            logging.debug("[config] set hedge mode response: %s", res)
-        except Exception as e:
-            if '"code":-4059' in str(e):
-                logging.debug("[config] hedge mode unchanged: %s", e)
-            else:
-                logging.error("[config] error setting hedge mode: %s", e)
+        res = await self.cca.fetch_position_mode(params={"subType": "linear"})
+        hedged = bool(res["hedged"])
+        self.binance_position_mode_hedged = hedged
+        self.hedge_mode = hedged
+        if hedged:
+            self.log_once("[config] Binance account is in dual-side mode; running with positionSide.")
+        else:
+            self.log_once(
+                "[config] Binance account is in one-way mode; running without positionSide and using reduceOnly for closes."
+            )
 
     async def determine_utc_offset(self, verbose=True):
         # returns millis to add to utc to get exchange timestamp
